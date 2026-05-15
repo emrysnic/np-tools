@@ -6,7 +6,7 @@ const NP_USER = process.env.NP_USER ?? ""
 const NP_PASSWD = process.env.NP_PASSWD ?? ""
 const GAME_ID = process.argv[2] ?? process.env.NP_GAME_ID ?? ""
 const OUTPUT_DIR = process.env.NP_OUTPUT_DIR ?? process.cwd()
-const PAGE_SIZE = Number(process.env.NP_PAGE_SIZE ?? "100")
+const PAGE_SIZE = Number(process.env.NP_PAGE_SIZE ?? "20")
 const VERSION = "np4"
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
@@ -109,7 +109,7 @@ async function fetchComments(cookie: string, key: string) {
   const response = await postForm("/game_api/fetch_game_message_comments", {
     type: "fetch_game_message_comments",
     key,
-    count: "100",
+    count: String(PAGE_SIZE),
     offset: "0",
     gameId: GAME_ID,
     version: VERSION,
