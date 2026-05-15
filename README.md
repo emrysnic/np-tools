@@ -12,7 +12,7 @@ This tool logs into the current `np4.ironhelmet.com` account system, then downlo
 - `NP_PASSWD` — account password
 - `GAME_ID` — game number to export
 - `NP_BASE_URL` — optional base URL, defaults to `https://np4.ironhelmet.com`
-- `NP_PAGE_SIZE` — optional page size for pagination, defaults to `100`
+- `NP_PAGE_SIZE` — optional page size for pagination, defaults to `20`
 - `NP_OUTPUT_DIR` — optional output directory, defaults to the current directory
 
 ### Usage

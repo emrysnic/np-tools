@@ -1,50 +1,64 @@
 import { mkdir, writeFile } from "node:fs/promises"
 import path from "node:path"
 
-const BASE_URL = (process.env.NP_BASE_URL ?? "https://np4.ironhelmet.com").replace(/\/+$/, "")
-const NP_USER = process.env.NP_USER ?? ""
-const NP_PASSWD = process.env.NP_PASSWD ?? ""
-const GAME_ID = process.argv[2] ?? process.env.NP_GAME_ID ?? ""
-const OUTPUT_DIR = process.env.NP_OUTPUT_DIR ?? process.cwd()
-const PAGE_SIZE = Number(process.env.NP_PAGE_SIZE ?? "20")
-const VERSION = "np4"
+export interface ExporterConfig {
+  baseUrl: string
+  user: string
+  passwd: string
+  gameId: string
+  outputDir: string
+  pageSize: number
+}
 
 type JsonValue = null | boolean | number | string | JsonValue[] | { [key: string]: JsonValue }
 type ServerResponse = [string, any]
 
-actionMain().catch((error) => {
-  console.error(error instanceof Error ? error.stack ?? error.message : error)
-  process.exitCode = 1
-})
+const DEFAULT_CONFIG: ExporterConfig = {
+  baseUrl: (process.env.NP_BASE_URL ?? "https://np4.ironhelmet.com").replace(/\/+$/, ""),
+  user: process.env.NP_USER ?? "",
+  passwd: process.env.NP_PASSWD ?? "",
+  gameId: process.argv[2] ?? process.env.NP_GAME_ID ?? "",
+  outputDir: process.env.NP_OUTPUT_DIR ?? process.cwd(),
+  pageSize: Number(process.env.NP_PAGE_SIZE ?? "20"),
+}
 
-async function actionMain() {
-  if (!NP_USER || !NP_PASSWD || !GAME_ID) {
-    throw new Error("Usage: NP_USER=... NP_PASSWD=... GAME_ID=... bun run src/index.ts")
-  }
+if (import.meta.main) {
+  actionMain().catch((error) => {
+    console.error(error instanceof Error ? error.stack ?? error.message : error)
+    process.exitCode = 1
+  })
+}
 
-  const userPart = sanitizePathPart(NP_USER)
-  const gamePart = sanitizePathPart(GAME_ID)
-  await mkdir(OUTPUT_DIR, { recursive: true })
+export async function actionMain() {
+  await runExport(DEFAULT_CONFIG)
+}
 
-  const cookie = await login()
-  await initPlayer(cookie)
+export async function runExport(config: ExporterConfig) {
+  validateConfig(config)
 
-  const diplomacy = await collectMessages(cookie, "game_diplomacy", true)
-  const events = await collectMessages(cookie, "game_event", false)
+  const userPart = sanitizePathPart(config.user)
+  const gamePart = sanitizePathPart(config.gameId)
+  await mkdir(config.outputDir, { recursive: true })
 
-  const messagesPath = path.join(OUTPUT_DIR, `${userPart}.${gamePart}.messages.jsonl`)
-  const eventsPath = path.join(OUTPUT_DIR, `${userPart}.${gamePart}.events.jsonl`)
+  const cookie = await login(config)
+  await initPlayer(config, cookie)
+
+  const diplomacy = await collectMessages(config, cookie, "game_diplomacy", true)
+  const events = await collectMessages(config, cookie, "game_event", false)
+
+  const messagesPath = path.join(config.outputDir, `${userPart}.${gamePart}.messages.jsonl`)
+  const eventsPath = path.join(config.outputDir, `${userPart}.${gamePart}.events.jsonl`)
 
   await writeJsonl(messagesPath, diplomacy)
   await writeJsonl(eventsPath, events)
 
-  console.log(JSON.stringify({ messages: messagesPath, events: eventsPath, diplomacy: diplomacy.length, eventsCount: events.length }, null, 2))
+  return { messagesPath, eventsPath, diplomacy, events }
 }
 
-async function login(): Promise<string> {
-  const response = await postForm("/account_api/login", {
-    alias: NP_USER,
-    password: NP_PASSWD,
+export async function login(config: ExporterConfig): Promise<string> {
+  const response = await postForm(config, "/account_api/login", {
+    alias: config.user,
+    password: config.passwd,
   })
 
   const [event, report] = response
@@ -60,8 +74,8 @@ async function login(): Promise<string> {
   return cookie
 }
 
-async function initPlayer(cookie: string) {
-  const response = await postForm("/account_api/init_player", {}, cookie)
+export async function initPlayer(config: ExporterConfig, cookie: string) {
+  const response = await postForm(config, "/account_api/init_player", {}, cookie)
   const [event, report] = response
   if (event !== "meta:init_player") {
     throw new Error(`Unexpected init_player response: ${JSON.stringify([event, report])}`)
@@ -69,71 +83,109 @@ async function initPlayer(cookie: string) {
   return report
 }
 
-async function collectMessages(cookie: string, group: "game_diplomacy" | "game_event", includeComments: boolean) {
+export async function collectMessages(
+  config: ExporterConfig,
+  cookie: string,
+  group: "game_diplomacy" | "game_event",
+  includeComments: boolean,
+) {
   const rows: any[] = []
   let offset = 0
 
   while (true) {
-    const response = await postForm("/game_api/fetch_game_messages", {
+    const response = await postForm(config, "/game_api/fetch_game_messages", {
       type: "fetch_game_messages",
       group,
-      count: String(PAGE_SIZE),
+      count: String(config.pageSize),
       offset: String(offset),
-      gameId: GAME_ID,
-      version: VERSION,
+      gameId: config.gameId,
+      version: "np4",
     }, cookie)
 
     const [event, report] = response
-    if (event !== "messages:new_messages") {
+    if (event !== "message:new_messages") {
       throw new Error(`Unexpected fetch_game_messages response for ${group}: ${JSON.stringify([event, report])}`)
     }
 
-    const messages = Array.isArray(report?.messages) ? report.messages : []
+    const messages = extractMessageArray(report)
     for (const message of messages) {
       if (includeComments) {
-        message.comments = await fetchComments(cookie, message.key)
+        message.comments = await fetchComments(config, cookie, message.key)
       }
+      normalizeMessage(message)
       rows.push(message)
     }
 
-    if (messages.length < PAGE_SIZE) {
+    if (messages.length < config.pageSize) {
       break
     }
-    offset += PAGE_SIZE
+    offset += config.pageSize
+  }
+
+  if (group === "game_event") {
+    rows.sort((a, b) => (b?.payload?.tick ?? 0) - (a?.payload?.tick ?? 0))
   }
 
   return rows
 }
 
-async function fetchComments(cookie: string, key: string) {
-  const response = await postForm("/game_api/fetch_game_message_comments", {
+export async function fetchComments(config: ExporterConfig, cookie: string, key: string) {
+  const response = await postForm(config, "/game_api/fetch_game_message_comments", {
     type: "fetch_game_message_comments",
     key,
-    count: String(PAGE_SIZE),
+    count: String(config.pageSize),
     offset: "0",
-    gameId: GAME_ID,
-    version: VERSION,
+    gameId: config.gameId,
+    version: "np4",
   }, cookie)
 
   const [event, report] = response
   if (event !== "message:new_comments") {
     throw new Error(`Unexpected fetch_game_message_comments response: ${JSON.stringify([event, report])}`)
   }
-  return Array.isArray(report?.messages) ? report.messages : []
+  return extractMessageArray(report).map(normalizeComment)
 }
 
-async function postForm(pathname: string, data: Record<string, string>, cookie?: string): Promise<ServerResponse> {
+function normalizeMessage(message: any) {
+  if (!message || typeof message !== "object") return message
+  if (message.payload && typeof message.payload === "object") {
+    if (message.payload.body !== undefined && message.body === undefined) {
+      message.body = message.payload.body
+    }
+  }
+  return message
+}
+
+function normalizeComment(comment: any) {
+  if (!comment || typeof comment !== "object") return comment
+  if (comment.payload && typeof comment.payload === "object") {
+    if (comment.payload.senderUid !== undefined && comment.player_uid === undefined) {
+      comment.player_uid = comment.payload.senderUid
+    }
+    if (comment.payload.body !== undefined && comment.body === undefined) {
+      comment.body = comment.payload.body
+    }
+  }
+  return comment
+}
+
+export async function postForm(
+  config: ExporterConfig,
+  pathname: string,
+  data: Record<string, string>,
+  cookie?: string,
+): Promise<ServerResponse> {
   const body = new URLSearchParams(data)
   const headers: Record<string, string> = {
     "Content-Type": "application/x-www-form-urlencoded",
-    "Accept": "application/json, text/plain, */*",
+    Accept: "application/json, text/plain, */*",
     "User-Agent": "np-tools/1.0",
   }
   if (cookie) {
     headers.Cookie = cookie
   }
 
-  const response = await fetch(`${BASE_URL}${pathname}`, {
+  const response = await fetch(`${config.baseUrl}${pathname}`, {
     method: "POST",
     headers,
     body,
@@ -161,6 +213,12 @@ async function postForm(pathname: string, data: Record<string, string>, cookie?:
   return [event, report]
 }
 
+function validateConfig(config: ExporterConfig) {
+  if (!config.user || !config.passwd || !config.gameId) {
+    throw new Error("Usage: NP_USER=... NP_PASSWD=... GAME_ID=... bun run src/index.ts")
+  }
+}
+
 function extractSetCookie(response: Response): string {
   const getSetCookie = (response.headers as any).getSetCookie
   let cookies: string[] = []
@@ -183,6 +241,16 @@ function cookieFromHeaders(cookieHeader?: string): string {
 function extractErrorMessage(report: any): string | undefined {
   if (!report || typeof report !== "object") return undefined
   return report.message ?? report.error ?? report.reason ?? report.note
+}
+
+function extractMessageArray(report: any): any[] {
+  if (!report || typeof report !== "object") return []
+  if (Array.isArray(report.messages)) return report.messages
+  if (report.data && typeof report.data === "object" && Array.isArray(report.data.messages)) {
+    return report.data.messages
+  }
+  if (Array.isArray(report.items)) return report.items
+  return []
 }
 
 function safeJsonParse(text: string): unknown {
